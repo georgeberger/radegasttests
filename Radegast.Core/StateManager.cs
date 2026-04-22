@@ -84,6 +84,10 @@ namespace Radegast
         private bool displayEndWalk = false;
         private long _lastWalkStartTick = 0;
         private const int WalkStartDebounceMs = 300;
+	// Add alongside the other private fields
+	private volatile int _lastCameraUpdateTick = 0;
+	private const int CameraUpdateIntervalMs = 50; // 20 Hz max
+
 
         // Tracks the last SittingOn local-ID for which we requested object data.
         // Prevents RequestObject from firing on every AvatarUpdate/TerseObjectUpdate
@@ -900,7 +904,15 @@ namespace Radegast
         {
             if (!CameraTracksOwnAvatar) { return; }
 
-            if (Client.Self.SittingOn != 0)
+    // Throttle to ~20 Hz. AvatarUpdate and TerseObjectUpdate fire on parallel
+    // threads and can call this hundreds of times per second during a crossing,
+    // each triggering Client.Self.SimPosition which logs a warning for every
+    // call while the vehicle object is not yet in the new sim's tracker.
+    int now = Environment.TickCount;
+    if (now - _lastCameraUpdateTick < CameraUpdateIntervalMs) { return; }
+    _lastCameraUpdateTick = now;
+
+    if (Client.Self.SittingOn != 0)
             {
                 var sim = FindSimulatorForLocalID(Client.Self.SittingOn);
                 if (!sim.ObjectsPrimitives.ContainsKey(Client.Self.SittingOn))
