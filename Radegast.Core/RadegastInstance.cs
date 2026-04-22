@@ -35,7 +35,21 @@ namespace Radegast
 {
     public abstract class RadegastInstance : IRadegastInstance
     {
+        public enum RegionCrossingState
+        {
+            None,
+            Preparing,
+            Connecting,
+            WaitingForHandshake,
+            Finished
+        }
+
         public const string INCOMPLETE_NAME = "Loading...";
+
+        public RegionCrossingState CrossingState { get; protected set; } = RegionCrossingState.None;
+        protected System.Timers.Timer? m_CrossingHandshakeTimer;
+        protected Simulator? m_CrossingTargetSim;
+        protected int m_CrossingRetryCount;
 
         /// <summary>When was Radegast started (UTC)</summary>
         public readonly DateTime StartupTimeUTC = DateTime.UtcNow;
@@ -115,7 +129,6 @@ namespace Radegast
         }
 
         public IMSessionManager IMSessions { get; private set; } = null!;
-        private InitialOutfitHandler? _initialOutfitHandler;
         // Cancellation token source for COF initialization retries
         private CancellationTokenSource? _cofInitCts;
 
@@ -245,9 +258,11 @@ namespace Radegast
                             throw new InvalidOperationException("Simulator capabilities not ready");
                         }
 
-                        COF = new OutfitManager(this);
-
-                        Logger.Info("COF initialization: COF constructed", Client);
+                        if (COF == null)
+                        {
+                            COF = new OutfitManager(this);
+                            Logger.Info("COF initialization: COF constructed", Client);
+                        }
 
                         // Caps are already available but SimChanged already fired before OutfitManager
                         // was constructed, so Simulator_OnCapabilitiesReceived never hooked up.
@@ -260,10 +275,10 @@ namespace Radegast
                         }
 
                         // Now it's safe to initialize RLV and the managers that depend on COF
-                        RLV = new RlvManager(this);
-
-                        // Initialize core handlers that rely on client/login lifecycle
-                        _initialOutfitHandler = new InitialOutfitHandler(client, COF);
+                        if (RLV == null)
+                        {
+                            RLV = new RlvManager(this);
+                        }
 
                         Logger.Info("COF initialization completed", Client);
                         break;
@@ -287,8 +302,11 @@ namespace Radegast
 
                                 try
                                 {
-                                    COF = new OutfitManager(this);
-                                    Logger.Info("COF initialization: COF constructed on periodic retry", Client);
+                                    if (COF == null)
+                                    {
+                                        COF = new OutfitManager(this);
+                                        Logger.Info("COF initialization: COF constructed on periodic retry", Client);
+                                    }
 
                                     var retryInit = await COF.InitializeAsync(token).ConfigureAwait(false);
                                     if (!retryInit)
@@ -296,22 +314,10 @@ namespace Radegast
                                         throw new InvalidOperationException("COF.InitializeAsync failed on periodic retry");
                                     }
 
-                                    RLV = new RlvManager(this);
-
-                                    GridManger = new GridManager();
-                                    GridManger.LoadGrids();
-
-                                    Names = new NameManager(this);
-                                    GestureManager = new LibreMetaverse.GestureManager(Client);
-                                    LslSyntax = new LslSyntax(Client);
-
-                                    IMSessions = new IMSessionManager(this);
-                                    IMSessions.SessionOpened += IMSessions_SessionOpened;
-                                    IMSessions.SessionClosed += IMSessions_SessionClosed;
-                                    IMSessions.TypingStarted += IMSessions_TypingStarted;
-                                    IMSessions.TypingStopped += IMSessions_TypingStopped;
-
-                                    _initialOutfitHandler = new InitialOutfitHandler(client, COF);
+                                    if (RLV == null)
+                                    {
+                                        RLV = new RlvManager(this);
+                                    }
 
                                     Logger.Info("COF periodic retry succeeded", Client);
                                     return;
@@ -384,6 +390,21 @@ namespace Radegast
             client.Self.Movement.AutoResetControls = false;
             client.Self.Movement.UpdateInterval = 250;
 
+            // Reset crossing state on initialization/reconnect
+            CrossingState = RegionCrossingState.None;
+            m_CrossingTargetSim = null;
+            m_CrossingRetryCount = 0;
+            if (m_CrossingHandshakeTimer != null)
+            {
+                m_CrossingHandshakeTimer.Stop();
+            }
+            else
+            {
+                m_CrossingHandshakeTimer = new System.Timers.Timer(250);
+                m_CrossingHandshakeTimer.Elapsed += CrossingHandshakeTimer_Elapsed;
+                m_CrossingHandshakeTimer.AutoReset = true;
+            }
+
             RegisterClientEvents(client);
         }
 
@@ -394,6 +415,8 @@ namespace Radegast
             client.Groups.GroupDropped += Groups_GroupDropped;
             client.Groups.GroupJoinedReply += Groups_GroupsChanged;
             client.Network.LoginProgress += Network_LoginProgress;
+            client.Network.SimChanged += Network_SimChanged;
+            client.Self.RegionCrossed += Self_RegionCrossed;
             if (NetCom != null)
             {
                 NetCom.ClientConnected += NetCom_ClientConnected;
@@ -408,10 +431,92 @@ namespace Radegast
             client.Groups.GroupDropped -= Groups_GroupDropped;
             client.Groups.GroupJoinedReply -= Groups_GroupsChanged;
             client.Network.LoginProgress -= Network_LoginProgress;
+            client.Network.SimChanged -= Network_SimChanged;
+            client.Self.RegionCrossed -= Self_RegionCrossed;
             if (NetCom != null)
             {
                 NetCom.ClientConnected -= NetCom_ClientConnected;
                 ClientChanged -= NetCom.Instance_ClientChanged;
+            }
+        }
+
+        private void Self_RegionCrossed(object? sender, RegionCrossedEventArgs e)
+        {
+                if (e.OldSimulator != null && e.NewSimulator != null &&
+        e.OldSimulator.Handle == e.NewSimulator.Handle)
+    {
+        Logger.Debug(
+            $"Ignoring self-crossing: already in {e.NewSimulator.Name} " +
+            $"(handle {e.NewSimulator.Handle})", Client);
+        // *** Do NOT call CompleteAgentMovement here. ***
+        // This event is a late duplicate that arrives after the crossing state
+        // machine has already completed. Sending CAM to the current sim causes
+        // the server to re-process the arrival, which resets the avatar's
+        // position to the border (~-4 on the crossing axis) and clears the
+        // sit state, stranding the avatar while the vehicle drives away.
+        return;
+               }
+
+            if (CrossingState == RegionCrossingState.None)
+            {
+                Logger.Info($"Beginning region crossing from {e.OldSimulator.Name} to {e.NewSimulator.Name} ({e.NewSimulator.IPEndPoint})", Client);
+                CrossingState = RegionCrossingState.Connecting;
+                m_CrossingTargetSim = e.NewSimulator;
+                m_CrossingRetryCount = 0;
+                
+                // Ensure timer is stopped before starting it (should be already, but being safe)
+                m_CrossingHandshakeTimer?.Stop();
+                m_CrossingHandshakeTimer?.Start();
+                
+                // Immediately send first handshake
+                Client.Self.CompleteAgentMovement(e.NewSimulator);
+            }
+        }
+
+        private void CrossingHandshakeTimer_Elapsed(object? sender, System.Timers.ElapsedEventArgs e)
+        {
+            if (CrossingState == RegionCrossingState.Connecting && m_CrossingTargetSim != null && Client.Network.Connected)
+            {
+                m_CrossingRetryCount++;
+                if (m_CrossingRetryCount > 40) // 10 seconds total
+                {
+                    Logger.Warn("Region crossing handshake timed out.", Client);
+                    m_CrossingHandshakeTimer?.Stop();
+                    CrossingState = RegionCrossingState.None;
+                    return;
+                }
+
+                // Resend handshake
+                Client.Self.CompleteAgentMovement(m_CrossingTargetSim);
+            }
+            else
+            {
+                m_CrossingHandshakeTimer?.Stop();
+            }
+        }
+
+        private UUID lastCofSim = UUID.Zero;
+        private void Network_SimChanged(object sender, SimChangedEventArgs e)
+        {
+            if (CrossingState == RegionCrossingState.Connecting)
+            {
+                Logger.Debug($"Region crossing state transition: Connecting -> Completed", Client);
+                CrossingState = RegionCrossingState.None;
+                m_CrossingHandshakeTimer?.Stop();
+                Logger.Info($"Region crossing completed successfully to {Client.Network.CurrentSim.Name}", Client);
+
+                // Tickle the ACK queue to prevent resend storms if caps were recycled
+                try { Client.Self.Movement.SendUpdate(true); } catch { }
+            }
+
+            if (NetCom.IsLoggedIn && Client.Network.CurrentSim != null)
+            {
+                if (Client.Network.CurrentSim.RegionID != lastCofSim)
+                {
+                    lastCofSim = Client.Network.CurrentSim.RegionID;
+                    Logger.Info($"Region changed to {Client.Network.CurrentSim.Name}, re-initializing COF", Client);
+                    EnsureCOFInitialized(Client);
+                }
             }
         }
 
@@ -667,15 +772,20 @@ namespace Radegast
         {
             if (GlobalSettings["disable_chat_im_log"]) return;
 
-            lock (_lockChatLog)
+            string fileName = ChatFileName(sessionName);
+            string logLine = DateTime.Now.ToString("[yyyy/MM/dd HH:mm:ss] ") + message + Environment.NewLine;
+
+            Task.Run(() =>
             {
-                try
+                lock (_lockChatLog)
                 {
-                    File.AppendAllText(ChatFileName(sessionName),
-                        DateTime.Now.ToString("[yyyy/MM/dd HH:mm:ss] ") + message + Environment.NewLine);
+                    try
+                    {
+                        File.AppendAllText(fileName, logLine);
+                    }
+                    catch (Exception) { }
                 }
-                catch (Exception) { }
-            }
+            });
         }
 
         protected virtual void InitializeAppData()
