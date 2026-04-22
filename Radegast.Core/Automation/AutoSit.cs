@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Radegast Metaverse Client
  * Copyright(c) 2009-2014, Radegast Development Team
  * Copyright(c) 2016-2025, Sjofn, LLC
@@ -23,6 +23,7 @@ using System.Timers;
 
 using OpenMetaverse;
 using OpenMetaverse.StructuredData;
+using Radegast;
 
 namespace Radegast.Automation
 {
@@ -86,15 +87,28 @@ namespace Radegast.Automation
                 TrySit();
             };
             m_Timer.Enabled = false;
+            m_instance.Client.Objects.ObjectUpdate += Objects_ObjectUpdate;
         }
 
         public void Dispose()
         {
+            m_instance.Client.Objects.ObjectUpdate -= Objects_ObjectUpdate;
             if (m_Timer != null)
             {
                 m_Timer.Enabled = false;
                 m_Timer.Dispose();
                 m_Timer = null;
+            }
+        }
+
+        private void Objects_ObjectUpdate(object sender, PrimEventArgs e)
+        {
+            if (Preferences?.Enabled == true && e.Prim.ID == Preferences.Primitive)
+            {
+                if (!m_instance.State.IsSitting)
+                {
+                    TrySit();
+                }
             }
         }
 
@@ -147,31 +161,64 @@ namespace Radegast.Automation
 
         public void TrySit()
         {
-            if (Preferences != null && m_instance.Client.Network.Connected)
+             if (Preferences == null || !m_instance.Client.Network.Connected) return;
+    if (!Preferences.Enabled || Preferences.Primitive == UUID.Zero) return;
+
+    // Guard against crossing windows regardless of how TrySit was invoked.
+    // Objects_ObjectUpdate already checks IsCrossing, but the 10-second timer
+    // calls TrySit() directly. During a crossing the vehicle's old LocalID may
+    // still be in the previous sim's object cache while CurrentSim has already
+    // changed, causing TryFindPrim to see the vehicle as "in a neighbor sim"
+    // and triggering a stand+walk that leaves the avatar at the border.
+    if (m_instance.State.IsCrossing) return;
+
+    if (!m_instance.State.IsSitting)
             {
-                if (Preferences.Enabled && Preferences.Primitive != UUID.Zero)
+                if (m_instance.State.TryFindPrim(Preferences.Primitive, out var sim, out var pos, false))
                 {
-                    if (!m_instance.State.IsSitting)
+                    if (sim != m_instance.Client.Network.CurrentSim)
                     {
-                        m_instance.State.SetSitting(true, Preferences.Primitive);
-                            if (m_Timer != null) m_Timer.Enabled = true;
-                                }
-                                else
-                                {
-                                    if (!m_instance.Client.Network.CurrentSim!.ObjectsPrimitives.ContainsKey(m_instance.Client.Self.SittingOn))
-                                    {
-                                        m_instance.State.SetSitting(false, UUID.Zero);
-                                    }
-                                }
-                            }
-                            else
+                        // Vehicle is in another sim! Walk towards it to trigger crossing.
+                        Vector3d targetGlobal = StateManager.GlobalPosition(sim, pos);
+                        if (!m_instance.State.IsWalking || Vector3d.Distance(m_instance.State.WalkToTarget, targetGlobal) > 5d)
+                        {
+                            m_instance.State.WalkTo(targetGlobal);
+                        }
+                        return;
+                    }
+                }
+                m_instance.State.SetSitting(true, Preferences.Primitive);
+                if (m_Timer != null) m_Timer.Enabled = true;
+            }
+            else
+            {
+                // We are sitting.
+                // Check if our vehicle crossed sims while we are still here.
+                if (m_instance.State.TryFindPrim(Preferences.Primitive, out var sim, out var pos, false))
+                {
+                    if (sim != m_instance.Client.Network.CurrentSim)
+                    {
+                        // Vehicle is in neighbor sim, but we are still here (or LibOMV lost track).
+                        // Stand up and walk there to force a crossing.
+                        Vector3d targetGlobal = StateManager.GlobalPosition(sim, pos);
+                        double dist = Vector3d.Distance(m_instance.Client.Self.GlobalPosition, targetGlobal);
+                        
+                        if (dist > 10d && dist < 100d) // Only catch up if reasonably close (e.g. crossing border) but not TOO close (which implies crossing in progress)
+                        {
+                            if (!m_instance.State.IsWalking || Vector3d.Distance(m_instance.State.WalkToTarget, targetGlobal) > 5d)
                             {
-                                if (m_Timer != null) m_Timer.Enabled = false;
+                                Logger.Debug("AutoSit: Vehicle crossed sims, standing up to follow. Distance: " + dist);
+                                m_instance.State.SetSitting(false, UUID.Zero);
+                                m_instance.State.WalkTo(targetGlobal);
                             }
                         }
-                        else
+                        else if (dist <= 10d)
                         {
-                            if (m_Timer != null) m_Timer.Enabled = false; // being lazy here, just letting timer elapse rather than disabling on client disconnect
+                            Logger.Debug("AutoSit: Vehicle in neighbor sim but very close (" + dist + "m), assuming crossing in progress.");
+                        }
+                    }
+                }
+                if (m_Timer != null) m_Timer.Enabled = false;
             }
         }
     }
